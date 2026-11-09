@@ -1,0 +1,456 @@
+name: Build APK
+on: [push, workflow_dispatch]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Criar projeto
+        run: |
+          mkdir -p app/src/main/java/com/rds/app
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "RelogioDeSonhos"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+            id("com.android.application") version "8.5.2" apply false
+            id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          echo "org.gradle.jvmargs=-Xmx2g" > gradle.properties
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+            id("com.android.application")
+            id("org.jetbrains.kotlin.android")
+          }
+          android {
+            namespace = "com.rds.app"
+            compileSdk = 34
+            defaultConfig {
+              applicationId = "com.rds.app"
+              minSdk = 30
+              targetSdk = 34
+              versionCode = 1
+              versionName = "1.0"
+            }
+            compileOptions {
+              sourceCompatibility = JavaVersion.VERSION_17
+              targetCompatibility = JavaVersion.VERSION_17
+            }
+            kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
+            <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
+            <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
+            <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+            <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
+            <application android:label="Relógio de Sonhos" android:icon="@android:drawable/ic_lock_idle_alarm" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+              <activity android:name=".MainActivity" android:exported="true" android:configChanges="orientation|screenSize|keyboardHidden">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+              <receiver android:name=".AlarmReceiver" android:exported="false"/>
+            </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/rds/app/MainActivity.kt <<'EOF'
+          package com.rds.app
+
+          import android.Manifest
+          import android.app.*
+          import android.content.*
+          import android.content.pm.PackageManager
+          import android.graphics.*
+          import android.media.*
+          import android.net.Uri
+          import android.os.*
+          import android.provider.MediaStore
+          import android.provider.OpenableColumns
+          import android.util.Size
+          import android.view.*
+          import android.webkit.MimeTypeMap
+          import android.widget.*
+          import java.io.File
+          import java.security.MessageDigest
+          import java.util.Calendar
+
+          val BG = Color.parseColor("#0E1024")
+          val SF = Color.parseColor("#1A1D3A")
+          val AC = Color.parseColor("#6A5AE0")
+          val GD = Color.parseColor("#F2C96B")
+          val MU = Color.parseColor("#8A8FB8")
+
+          class Al(val id: Int, val h: Int, val m: Int, var on: Boolean, val label: String)
+
+          object Alarms {
+            fun load(c: Context): MutableList<Al> =
+              c.getSharedPreferences("rs", 0).getString("al", "")!!.split(";").filter { it.isNotBlank() }.mapNotNull {
+                val p = it.split("|")
+                if (p.size < 5) null else Al(p[0].toInt(), p[1].toInt(), p[2].toInt(), p[3] == "1", p[4])
+              }.toMutableList()
+
+            fun save(c: Context, l: List<Al>) {
+              c.getSharedPreferences("rs", 0).edit()
+                .putString("al", l.joinToString(";") { "${it.id}|${it.h}|${it.m}|${if (it.on) 1 else 0}|${it.label}" }).apply()
+            }
+
+            fun schedule(c: Context, a: Al) {
+              val am = c.getSystemService(AlarmManager::class.java)
+              val pi = PendingIntent.getBroadcast(c, a.id,
+                Intent(c, AlarmReceiver::class.java).putExtra("label", a.label).putExtra("id", a.id),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+              if (!a.on) { am.cancel(pi); return }
+              val t = Calendar.getInstance().apply {
+                set(Calendar.HOUR_OF_DAY, a.h); set(Calendar.MINUTE, a.m); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+                if (timeInMillis <= System.currentTimeMillis()) add(Calendar.DAY_OF_YEAR, 1)
+              }
+              val show = PendingIntent.getActivity(c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+              am.setAlarmClock(AlarmManager.AlarmClockInfo(t.timeInMillis, show), pi)
+            }
+          }
+
+          class AlarmReceiver : BroadcastReceiver() {
+            override fun onReceive(c: Context, i: Intent) {
+              val nm = c.getSystemService(NotificationManager::class.java)
+              val ch = NotificationChannel("alarm", "Despertador", NotificationManager.IMPORTANCE_HIGH)
+              ch.setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM),
+                AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build())
+              ch.enableVibration(true)
+              nm.createNotificationChannel(ch)
+              val open = PendingIntent.getActivity(c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+              val n = Notification.Builder(c, "alarm")
+                .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                .setContentTitle("Relógio de Sonhos")
+                .setContentText(i.getStringExtra("label") ?: "Despertador")
+                .setCategory(Notification.CATEGORY_ALARM)
+                .setContentIntent(open).setAutoCancel(true).setFullScreenIntent(open, true).build()
+              n.flags = n.flags or Notification.FLAG_INSISTENT
+              nm.notify(1, n)
+              val id = i.getIntExtra("id", -1)
+              Alarms.load(c).firstOrNull { it.id == id && it.on }?.let { Alarms.schedule(c, it) }
+            }
+          }
+
+          class MainActivity : Activity() {
+            lateinit var root: FrameLayout
+            var picking = false
+            var folder: File? = null
+            var screen = "clock"
+            var stage = 0
+            var tmp = ""
+            var timeTv: TextView? = null
+            val h = Handler(Looper.getMainLooper())
+            val REQ_PICK = 11
+            val REQ_DEL = 12
+            val prefs: SharedPreferences get() = getSharedPreferences("rs", 0)
+            val vaultDir: File get() = File(filesDir, "vault").apply { mkdirs() }
+
+            fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+            fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_LONG).show()
+            fun hash(s: String) = MessageDigest.getInstance("SHA-256").digest(("rds:" + s).toByteArray()).joinToString("") { "%02x".format(it) }
+            fun tv(t: String, sp: Float, col: Int = Color.WHITE) = TextView(this).apply { text = t; textSize = sp; setTextColor(col) }
+            fun btn(t: String, bg: Int = SF, f: () -> Unit) = Button(this).apply {
+              text = t; setTextColor(Color.WHITE); setBackgroundColor(bg); isAllCaps = false; setOnClickListener { f() }
+            }
+            fun col() = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(16), dp(16), dp(16)) }
+            fun show(v: View) { root.removeAllViews(); root.addView(v) }
+            fun isVid(x: File) = x.extension.lowercase() !in listOf("jpg", "jpeg", "png", "gif", "webp", "heic", "bmp")
+            fun thumb(x: File): Bitmap? = try {
+              if (isVid(x)) ThumbnailUtils.createVideoThumbnail(x, Size(300, 300), null)
+              else ThumbnailUtils.createImageThumbnail(x, Size(300, 300), null)
+            } catch (e: Exception) { null }
+
+            fun ask(t: String, ok: (String) -> Unit) {
+              val e = EditText(this)
+              AlertDialog.Builder(this).setTitle(t).setView(e)
+                .setPositiveButton("OK") { _, _ -> if (e.text.isNotBlank()) ok(e.text.toString().trim()) }
+                .setNegativeButton("Cancelar", null).show()
+            }
+
+            override fun onCreate(b: Bundle?) {
+              super.onCreate(b)
+              root = FrameLayout(this); root.setBackgroundColor(BG); setContentView(root)
+              window.statusBarColor = BG; window.navigationBarColor = BG
+              if (prefs.getString("pin", null) == null) stage = 1
+              if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+              clock()
+              h.post(object : Runnable {
+                override fun run() {
+                  timeTv?.text = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())
+                  h.postDelayed(this, 1000)
+                }
+              })
+            }
+
+            override fun onStop() { super.onStop(); if (!picking && screen != "clock") clock() }
+            override fun onBackPressed() {
+              when (screen) {
+                "viewer" -> folder?.let { openFolder(it) }
+                "folder" -> vault()
+                "vault", "add" -> clock()
+                else -> super.onBackPressed()
+              }
+            }
+
+            fun clock() {
+              screen = "clock"
+              val c = col()
+              val top = LinearLayout(this); top.gravity = Gravity.CENTER_VERTICAL
+              top.addView(tv("Relógio de Sonhos", 22f), LinearLayout.LayoutParams(0, -2, 1f))
+              top.addView(btn("+", AC) { addScreen() })
+              c.addView(top)
+              timeTv = tv("", 56f).apply { gravity = Gravity.CENTER; setPadding(0, dp(40), 0, dp(30)) }
+              c.addView(timeTv)
+              if (stage > 0) c.addView(tv(if (stage == 1) "Para criar sua senha secreta, toque em + e digite 6 números." else "Toque em + e digite a mesma senha de 6 números para confirmar.", 14f, MU))
+              val list = col()
+              val als = Alarms.load(this)
+              als.sortedBy { it.h * 60 + it.m }.forEach { a ->
+                val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setBackgroundColor(SF); setPadding(dp(14), dp(8), dp(14), dp(8)) }
+                row.addView(tv("%02d:%02d".format(a.h, a.m), 30f, if (a.on) Color.WHITE else MU))
+                row.addView(tv("  " + a.label.ifBlank { "Despertador" }, 14f, MU), LinearLayout.LayoutParams(0, -2, 1f))
+                val sw = Switch(this); sw.isChecked = a.on
+                sw.setOnCheckedChangeListener { _, v -> a.on = v; Alarms.save(this, als); Alarms.schedule(this, a); clock() }
+                row.addView(sw)
+                row.addView(btn("Excluir") { a.on = false; Alarms.schedule(this, a); als.remove(a); Alarms.save(this, als); clock() })
+                list.addView(row, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+              }
+              val sv = ScrollView(this); sv.addView(list); c.addView(sv)
+              show(c)
+            }
+
+            fun addScreen() {
+              screen = "add"
+              var d = ""
+              val c = col()
+              val disp = tv("––:––", 48f).apply { gravity = Gravity.CENTER }
+              val msg = tv(when (stage) {
+                1 -> "Digite 4 números para um despertador, ou 6 para criar sua senha."
+                2 -> "Digite os mesmos 6 números para confirmar a senha."
+                else -> "Digite 4 números: hora e minutos."
+              }, 14f, MU)
+              val label = EditText(this).apply { hint = "Nome (opcional)"; setTextColor(Color.WHITE); setHintTextColor(MU); setSingleLine() }
+              fun fmt(): String {
+                val x = d.padEnd(4, '–')
+                var s = x.substring(0, 2) + ":" + x.substring(2, 4)
+                if (d.length > 4) s += ":" + d.substring(4).padEnd(2, '–')
+                return s
+              }
+              fun upd(t: String? = null) { disp.text = fmt(); if (t != null) msg.text = t }
+              c.addView(btn("Cancelar") { clock() })
+              c.addView(disp); c.addView(msg); c.addView(label)
+              val g = GridLayout(this); g.columnCount = 3
+              listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "⌫", "0", "Salvar").forEach { k ->
+                val b = btn(k, if (k == "Salvar") GD else SF) {
+                  when (k) {
+                    "⌫" -> { d = d.dropLast(1); upd() }
+                    "Salvar" -> {
+                      if (d.length == 6) {
+                        when {
+                          stage == 1 -> { tmp = d; stage = 2; d = ""; upd("Digite os mesmos 6 números de novo e toque em Salvar.") }
+                          stage == 2 -> if (d == tmp) {
+                            prefs.edit().putString("pin", hash(d)).apply(); stage = 0; tmp = ""; toast("Senha definida"); vault()
+                          } else { tmp = ""; stage = 1; d = ""; upd("As senhas não conferem. Digite 6 números e toque em Salvar.") }
+                          hash(d) == prefs.getString("pin", "") -> vault()
+                          else -> { d = ""; upd("Para um despertador, digite 4 números: hora e minutos.") }
+                        }
+                      } else if (d.length == 4) {
+                        val hh = d.substring(0, 2).toInt(); val mm = d.substring(2).toInt()
+                        if (hh > 23 || mm > 59) { d = ""; upd("Horário inválido.") } else {
+                          val l = Alarms.load(this)
+                          val a = Al((System.currentTimeMillis() % 1000000000).toInt(), hh, mm, true, label.text.toString().replace("|", " ").replace(";", " "))
+                          l.add(a); Alarms.save(this, l); Alarms.schedule(this, a); clock()
+                        }
+                      } else upd("Digite 4 números: hora e minutos.")
+                    }
+                    else -> if (d.length < 6) { d += k; upd() }
+                  }
+                }
+                if (k == "Salvar") b.setTextColor(Color.BLACK)
+                val lp = GridLayout.LayoutParams()
+                lp.width = 0; lp.height = dp(64); lp.columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f); lp.setMargins(dp(4), dp(4), dp(4), dp(4))
+                g.addView(b, lp)
+              }
+              c.addView(g)
+              show(c)
+            }
+
+            fun vault() {
+              screen = "vault"; folder = null
+              val c = col()
+              val top = LinearLayout(this)
+              top.addView(tv("Meu cofre", 22f), LinearLayout.LayoutParams(0, -2, 1f))
+              top.addView(btn("Nova pasta") { ask("Nome da pasta") { n -> File(vaultDir, n.replace("/", "-")).mkdirs(); vault() } })
+              top.addView(btn("Trancar", AC) { clock() })
+              c.addView(top)
+              val l = col()
+              (vaultDir.listFiles()?.filter { it.isDirectory }?.sortedBy { it.name } ?: listOf()).forEach { f ->
+                l.addView(btn(f.name + "  (" + (f.listFiles()?.size ?: 0) + ")") { openFolder(f) }, LinearLayout.LayoutParams(-1, dp(64)).apply { topMargin = dp(8) })
+              }
+              if (l.childCount == 0) l.addView(tv("Nenhuma pasta ainda. Toque em Nova pasta.", 15f, MU))
+              val sv = ScrollView(this); sv.addView(l); c.addView(sv)
+              show(c)
+            }
+
+            fun openFolder(f: File) {
+              screen = "folder"; folder = f
+              val c = col()
+              val top = LinearLayout(this)
+              top.addView(btn("‹") { vault() })
+              top.addView(tv(f.name, 20f), LinearLayout.LayoutParams(0, -2, 1f))
+              top.addView(btn("Adicionar", AC) { addFiles() })
+              top.addView(btn("⋯") {
+                AlertDialog.Builder(this).setItems(arrayOf("Renomear pasta", "Excluir pasta")) { _, w ->
+                  if (w == 0) ask("Novo nome") { n -> val nf = File(f.parentFile, n.replace("/", "-")); f.renameTo(nf); openFolder(nf) }
+                  else AlertDialog.Builder(this).setTitle("Excluir a pasta e tudo dentro dela?")
+                    .setPositiveButton("Excluir") { _, _ -> f.deleteRecursively(); vault() }
+                    .setNegativeButton("Cancelar", null).show()
+                }.show()
+              })
+              c.addView(top)
+              val files = f.listFiles()?.sortedBy { it.lastModified() } ?: listOf()
+              val g = GridLayout(this); g.columnCount = 3
+              val w = resources.displayMetrics.widthPixels / 3 - dp(10)
+              files.forEachIndexed { i, x ->
+                val iv = ImageView(this)
+                iv.scaleType = ImageView.ScaleType.CENTER_CROP; iv.setBackgroundColor(SF); iv.setImageBitmap(thumb(x))
+                iv.setOnClickListener { viewer(files, i) }
+                val lp = GridLayout.LayoutParams(); lp.width = w; lp.height = w; lp.setMargins(dp(4), dp(4), dp(4), dp(4))
+                g.addView(iv, lp)
+              }
+              if (files.isEmpty()) c.addView(tv("Pasta vazia. Toque em Adicionar.", 15f, MU))
+              val sv = ScrollView(this); sv.addView(g); c.addView(sv)
+              show(c)
+            }
+
+            fun viewer(files: List<File>, start: Int) {
+              screen = "viewer"
+              var i = start
+              val c = LinearLayout(this); c.orientation = LinearLayout.VERTICAL; c.setBackgroundColor(Color.BLACK)
+              val box = FrameLayout(this)
+              fun draw() {
+                box.removeAllViews()
+                val x = files[i]
+                if (isVid(x)) {
+                  val v = VideoView(this)
+                  v.setVideoURI(Uri.fromFile(x))
+                  v.setMediaController(MediaController(this).also { it.setAnchorView(v) })
+                  v.setOnCompletionListener { if (i < files.size - 1) { i++; draw() } }
+                  box.addView(v, FrameLayout.LayoutParams(-1, -1))
+                  v.start()
+                } else {
+                  val iv = ImageView(this)
+                  iv.setImageBitmap(BitmapFactory.decodeFile(x.path, BitmapFactory.Options().apply { inSampleSize = 4 }))
+                  box.addView(iv, FrameLayout.LayoutParams(-1, -1))
+                }
+              }
+              val bar = LinearLayout(this)
+              bar.addView(btn("‹") { if (i > 0) { i--; draw() } })
+              bar.addView(btn("Tirar do cofre", AC) { export(files[i]); folder?.let { openFolder(it) } }, LinearLayout.LayoutParams(0, -2, 1f))
+              bar.addView(btn("Excluir") {
+                AlertDialog.Builder(this).setTitle("Excluir este arquivo?")
+                  .setPositiveButton("Excluir") { _, _ -> files[i].delete(); folder?.let { openFolder(it) } }
+                  .setNegativeButton("Cancelar", null).show()
+              })
+              bar.addView(btn("›") { if (i < files.size - 1) { i++; draw() } })
+              bar.addView(btn("X") { folder?.let { openFolder(it) } })
+              c.addView(box, LinearLayout.LayoutParams(-1, 0, 1f))
+              c.addView(bar)
+              show(c)
+              draw()
+            }
+
+            fun export(x: File) {
+              val vid = isVid(x)
+              val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(x.extension.lowercase()) ?: (if (vid) "video/mp4" else "image/jpeg")
+              val cv = ContentValues()
+              cv.put(MediaStore.MediaColumns.DISPLAY_NAME, x.name)
+              cv.put(MediaStore.MediaColumns.MIME_TYPE, mime)
+              cv.put(MediaStore.MediaColumns.RELATIVE_PATH, (if (vid) "Movies" else "Pictures") + "/Cofre")
+              val u = contentResolver.insert(if (vid) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
+              if (u != null) {
+                contentResolver.openOutputStream(u)?.use { o -> x.inputStream().use { it.copyTo(o) } }
+                x.delete()
+                toast("De volta na galeria (pasta Cofre)")
+              } else toast("Não foi possível devolver o arquivo")
+            }
+
+            fun addFiles() {
+              val perms = if (Build.VERSION.SDK_INT >= 33) arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
+                          else arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+              picking = true
+              if (perms.any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }) { requestPermissions(perms, 2); return }
+              startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).setType("*/*")
+                .putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "video/*"))
+                .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true).addCategory(Intent.CATEGORY_OPENABLE), REQ_PICK)
+            }
+
+            override fun onRequestPermissionsResult(rc: Int, p: Array<out String>, r: IntArray) {
+              picking = false
+              if (rc == 2) { if (r.isNotEmpty() && r.all { it == PackageManager.PERMISSION_GRANTED }) addFiles() else toast("Sem a permissão de fotos e vídeos não dá para adicionar arquivos.") }
+            }
+
+            fun fileName(u: Uri): String {
+              var n = contentResolver.query(u, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { if (it.moveToFirst()) it.getString(0) else null }
+                ?: ("arquivo_" + System.currentTimeMillis())
+              if (!n.contains('.')) n += "." + (MimeTypeMap.getSingleton().getExtensionFromMimeType(contentResolver.getType(u)) ?: "bin")
+              return n
+            }
+
+            fun uniq(f: File): File {
+              var x = f; var k = 1
+              while (x.exists()) { x = File(f.parentFile, "${k++}_" + f.name) }
+              return x
+            }
+
+            override fun onActivityResult(rq: Int, rs: Int, d: Intent?) {
+              super.onActivityResult(rq, rs, d)
+              picking = false
+              if (rq == REQ_PICK && rs == RESULT_OK && d != null && folder != null) {
+                val uris = mutableListOf<Uri>()
+                val cd = d.clipData
+                if (cd != null) { for (k in 0 until cd.itemCount) uris.add(cd.getItemAt(k).uri) } else d.data?.let { uris.add(it) }
+                val media = mutableListOf<Uri>()
+                var n = 0
+                uris.forEach { u ->
+                  try {
+                    val dest = uniq(File(folder, fileName(u)))
+                    contentResolver.openInputStream(u)?.use { i -> dest.outputStream().use { o -> i.copyTo(o) } }
+                    n++
+                    try { media.add(if (u.authority == "media") u else MediaStore.getMediaUri(this, u)!!) } catch (e: Exception) { }
+                  } catch (e: Exception) { }
+                }
+                folder?.let { openFolder(it) }
+                if (media.isNotEmpty()) {
+                  toast("$n no cofre. Confirme para apagar os originais da galeria.")
+                  picking = true
+                  val pi = MediaStore.createDeleteRequest(contentResolver, media)
+                  startIntentSenderForResult(pi.intentSender, REQ_DEL, null, 0, 0, 0)
+                } else toast("$n no cofre. Apague os originais na galeria.")
+              }
+            }
+          }
+          EOF
+      - name: Compilar
+        run: gradle assembleDebug --no-daemon
+      - name: Publicar APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
